@@ -116,6 +116,13 @@ curl -s "$SITE/api/feedback"
    (watch it in CodeDeploy). If the 5xx or unhealthy-host alarm fires, it rolls back automatically.
    Otherwise all traffic moves to green and blue is terminated after 5 minutes.
 
+### Manual release (without CodeBuild)
+
+`scripts/release-ecs.sh <version> [app-dir]` runs the same steps as the pipeline: build and push the
+image, register a new task definition revision, and start the CodeDeploy blue/green deployment.
+It's for when CodeBuild is unavailable, for example a new account whose build concurrency quota
+hasn't been raised yet.
+
 ### Rollback demo
 
 Change `/health` in `app/app.py` to return status 500 and push. The green tasks never become
@@ -140,7 +147,7 @@ environment is the same commands with `ENV_NAME=staging`.
 
 | Failure | Action |
 |---|---|
-| Bad release (ECS) | Automatic: CodeDeploy rolls back on alarm or failed health checks. Manual: *Stop and roll back* in CodeDeploy. |
+| Bad release (ECS) | Automatic: CodeDeploy rolls back on alarm or failed health checks. Manual: *Stop and roll back* in CodeDeploy. If a rollback stops mid-canary with `ECS_UPDATE_ERROR … behind prod listener`, point the prod listener 100% at the original target group, then ship the fix as a new release (ECS refuses direct task-set changes on CodeDeploy-controlled services). |
 | Bad release (EC2) | Automatic rollback on failed `ValidateService` hook or 5xx alarm. Manual: redeploy the previous revision in CodeDeploy. |
 | Deleted or corrupted feedback | `aws dynamodb restore-table-to-point-in-time --source-table-name feedback-prod --target-table-name feedback-prod-restored --use-latest-restorable-time` |
 | Database issue | RDS point-in-time restore from automated backups (1-day window) |
