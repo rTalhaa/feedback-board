@@ -1,0 +1,38 @@
+# eksctl cluster: one small managed node group, Pod Identity for AWS access, metrics-server for the HPA.
+# ${ACCOUNT_ID} and ${KMS_KEY_ARN} are filled in by scripts/deploy.sh eks.
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: feedback-prod
+  region: ap-south-1
+  tags: { Project: feedback-board }
+
+addons:
+  - name: vpc-cni
+  - name: coredns
+  - name: kube-proxy
+  - name: eks-pod-identity-agent
+  - name: metrics-server
+
+iam:
+  podIdentityAssociations:
+    - namespace: default
+      serviceAccountName: feedback-dashboard
+      permissionPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: dynamodb:Scan
+            Resource: arn:aws:dynamodb:ap-south-1:${ACCOUNT_ID}:table/feedback-prod
+          - Effect: Allow
+            Action: kms:Decrypt
+            Resource: ${KMS_KEY_ARN}
+
+managedNodeGroups:
+  - name: ng-small
+    instanceType: t3.small
+    minSize: 1
+    desiredCapacity: 1
+    maxSize: 2
+    volumeSize: 20
+    tags: { Project: feedback-board }

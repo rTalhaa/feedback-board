@@ -1,0 +1,16 @@
+[Unit]
+Description=Feedback Board dashboard
+After=network-online.target
+
+[Service]
+User=nobody
+WorkingDirectory=/opt/feedback
+EnvironmentFile=/etc/feedback.env
+EnvironmentFile=/opt/feedback/version.env
+ExecStart=/opt/feedback/.venv/bin/gunicorn --bind 0.0.0.0:8080 --workers 2 app:app
+Restart=on-failure
+StandardOutput=append:/var/log/feedback/app.log
+StandardError=append:/var/log/feedback/app.log
+
+[Install]
+WantedBy=multi-user.target

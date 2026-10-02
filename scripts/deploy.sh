@@ -62,4 +62,34 @@ Pipeline:  $(out "feedback-pipeline-$ENV" PipelineUrl)
 EOF
 }
 
+ec2() {
+  foundation
+  local ip; ip=$(curl -s https://checkip.amazonaws.com)
+  cfn "feedback-ec2-$ENV" infra/5-ec2.yaml VpcId="$VPC" SubnetIds="$SUBNETS" KmsKeyArn="$KMS" \
+    AlertsTopicArn="$TOPIC" ArtifactBucketName="$BUCKET" AdminCidr="$ip/32"
+  local jenkins; jenkins=$(out "feedback-ec2-$ENV" JenkinsInstanceId)
+  cat <<EOF
+
+Done. Jenkins: $(out "feedback-ec2-$ENV" JenkinsUrl)  (allowed from $ip only)
+Initial admin password (wait ~3 min for install):
+  aws ssm send-command --instance-ids $jenkins --document-name AWS-RunShellScript \\
+    --parameters commands='cat /var/lib/jenkins/secrets/initialAdminPassword' --query Command.CommandId --output text
+Then: install suggested plugins > New Item > Pipeline > "Pipeline script from SCM" > Git
+  https://github.com/$(git remote get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##') branch main, script path Jenkinsfile
+EC2 app: $(out "feedback-ec2-$ENV" Ec2AppUrl)
+EOF
+}
+
+eks() {
+  foundation
+  local account; account=$(aws sts get-caller-identity --query Account --output text)
+  sed -e "s|\${ACCOUNT_ID}|$account|g" -e "s|\${KMS_KEY_ARN}|$KMS|g" k8s/cluster.yaml > k8s/.cluster.rendered.yaml
+  eksctl create cluster -f k8s/.cluster.rendered.yaml
+  local tag; tag=$(aws ecr describe-images --repository-name feedback-board/dashboard \
+    --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags[0]' --output text)
+  sed "s|\${IMAGE}|$ECR:$tag|" k8s/app.yaml | kubectl apply -f -
+  kubectl rollout status deployment/feedback-dashboard --timeout=5m
+  echo "EKS app: http://$(kubectl get svc feedback-dashboard -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+}
+
 "$PHASE"

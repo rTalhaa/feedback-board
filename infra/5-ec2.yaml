@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Feedback Board EC2 track - Jenkins CI server, an EC2 Auto Scaling group released by CodeDeploy
+  in-place (one at a time, auto-rollback), RDS PostgreSQL for visit tracking, SSM patching, CloudWatch agent logs.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  KmsKeyArn:
+    Type: String
+  AlertsTopicArn:
+    Type: String
+  ArtifactBucketName:
+    Type: String
+  AdminCidr:
+    Type: String
+    Description: Your public IP as x.x.x.x/32 - only this address can open Jenkins.
+  AppInstanceType:
+    Type: String
+    Default: t3.micro
+  JenkinsInstanceType:
+    Type: String
+    Default: t3.small
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # ---------- Network ----------
+  AlbPort8000:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: { "Fn::ImportValue": !Sub "feedback-${EnvName}-AlbSg" }
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      CidrIp: 0.0.0.0/0
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 app instances, ALB only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: { "Fn::ImportValue": !Sub "feedback-${EnvName}-AlbSg" }
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL from app instances only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref AppSecurityGroup }
+
+  JenkinsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Jenkins UI from the admin IP only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: !Ref AdminCidr }
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub feedback-${EnvName}-ec2
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 8080
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes: [{ Key: deregistration_delay.timeout_seconds, Value: "10" }]
+
+  AppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: { "Fn::ImportValue": !Sub "feedback-${EnvName}-AlbArn" }
+      Port: 8000
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref AppTargetGroup }]
+
+  # ---------- RDS PostgreSQL (free tier class, password managed in Secrets Manager) ----------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Feedback Board database subnets
+      SubnetIds: !Ref SubnetIds
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub feedback-${EnvName}
+      Engine: postgres
+      DBInstanceClass: db.t4g.micro
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !Ref KmsKeyArn
+      MasterUsername: feedback
+      ManageMasterUserPassword: true
+      MasterUserSecret: { KmsKeyId: !Ref KmsKeyArn }
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSecurityGroup]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 1          # point-in-time restore window for recovery
+      DeleteAutomatedBackups: true
+      DeletionProtection: false
+
+  # ---------- App instances ----------
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /feedback-board/${EnvName}/ec2-app
+      RetentionInDays: 7
+      KmsKeyId: !Ref KmsKeyArn
+
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore    # Session Manager + Patch Manager
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: app
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject                                  # CodeDeploy agent pulls revisions
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*
+              - Effect: Allow
+                Action: dynamodb:Scan
+                Resource: { "Fn::ImportValue": !Sub "feedback-${EnvName}-TableArn" }
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt Database.MasterUserSecret.SecretArn
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref KmsKeyArn
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AppRole]
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref AppInstanceType
+        IamInstanceProfile: { Arn: !GetAtt AppInstanceProfile.Arn }
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub "feedback-app-${EnvName}" }, { Key: Project, Value: feedback-board }]
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              dnf install -y ruby wget python3.12 amazon-cloudwatch-agent
+              cat > /etc/feedback.env <<EOF
+              TABLE_NAME=${TableName}
+              DB_HOST=${Database.Endpoint.Address}
+              DB_SECRET_ARN=${Database.MasterUserSecret.SecretArn}
+              AWS_DEFAULT_REGION=${AWS::Region}
+              HOME=/tmp
+              EOF
+              mkdir -p /var/log/feedback
+              cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<EOF
+              {"logs":{"logs_collected":{"files":{"collect_list":[
+                {"file_path":"/var/log/feedback/app.log","log_group_name":"${AppLogGroup}","log_stream_name":"{instance_id}"},
+                {"file_path":"/var/log/aws/codedeploy-agent/codedeploy-agent.log","log_group_name":"${AppLogGroup}","log_stream_name":"{instance_id}-codedeploy"}]}}}}
+              EOF
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s \
+                -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+              cd /tmp && wget -q https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install
+              chmod +x install && ./install auto
+            - TableName: { "Fn::ImportValue": !Sub "feedback-${EnvName}-TableName" }
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub feedback-app-${EnvName}
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      MinSize: "1"
+      MaxSize: "2"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier: !Ref SubnetIds
+      TargetGroupARNs: [!Ref AppTargetGroup]
+      HealthCheckType: EC2       # EC2, not ELB: a fresh instance is unhealthy in the TG until its first CodeDeploy release
+      HealthCheckGracePeriod: 300
+
+  AppCpuScaling:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 60
+
+  # ---------- CodeDeploy in-place ----------
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: codedeploy.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole]
+      Policies:
+        - PolicyName: launch-template
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [iam:PassRole, ec2:RunInstances, ec2:CreateTags]
+                Resource: "*"
+
+  CodeDeployApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub feedback-ec2-${EnvName}
+      ComputePlatform: Server
+
+  Ec2Target5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${EnvName}-ec2-5xx
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - { Name: LoadBalancer, Value: { "Fn::ImportValue": !Sub "feedback-${EnvName}-AlbFullName" } }
+        - { Name: TargetGroup, Value: !GetAtt AppTargetGroup.TargetGroupFullName }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopicArn]
+
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApp
+      DeploymentGroupName: !Sub feedback-ec2-${EnvName}-inplace
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      DeploymentStyle: { DeploymentType: IN_PLACE, DeploymentOption: WITH_TRAFFIC_CONTROL }
+      AutoScalingGroups: [!Ref AppAutoScalingGroup]
+      LoadBalancerInfo:
+        TargetGroupInfoList: [{ Name: !GetAtt AppTargetGroup.TargetGroupName }]
+      AlarmConfiguration:
+        Enabled: true
+        Alarms: [{ Name: !Ref Ec2Target5xxAlarm }]
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_ALARM]
+
+  # ---------- Patching (SSM Patch Manager, default AL2023 baseline) ----------
+  PatchAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      AssociationName: !Sub feedback-${EnvName}-patching
+      Name: AWS-RunPatchBaseline
+      ScheduleExpression: cron(0 3 ? * SUN *)
+      Parameters:
+        Operation: [Install]
+        RebootOption: [NoReboot]
+      Targets: [{ Key: tag:Project, Values: [feedback-board] }]
+
+  # ---------- Jenkins ----------
+  JenkinsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+      Policies:
+        - PolicyName: release-to-codedeploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucketName}/ec2/*
+              - Effect: Allow
+                Action: [codedeploy:RegisterApplicationRevision, codedeploy:CreateDeployment, codedeploy:GetDeployment,
+                         codedeploy:GetDeploymentConfig, codedeploy:GetApplicationRevision]
+                Resource: "*"
+              - Effect: Allow
+                Action: [kms:Encrypt, kms:Decrypt, kms:GenerateDataKey]
+                Resource: !Ref KmsKeyArn
+
+  JenkinsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref JenkinsRole]
+
+  JenkinsInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref JenkinsInstanceType
+      IamInstanceProfile: !Ref JenkinsInstanceProfile
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds: [!Ref JenkinsSecurityGroup]
+      MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+      Tags: [{ Key: Name, Value: !Sub "feedback-jenkins-${EnvName}" }, { Key: Project, Value: feedback-board }]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          set -euxo pipefail
+          fallocate -l 1G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+          dnf install -y java-21-amazon-corretto-headless fontconfig git python3.12 python3.12-pip
+          wget -q -O /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/redhat-stable/jenkins.repo
+          rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io-2023.key
+          dnf install -y jenkins
+          systemctl enable --now jenkins
+
+Outputs:
+  Ec2AppUrl:
+    Value: !Sub
+      - http://${Dns}:8000
+      - Dns: { "Fn::ImportValue": !Sub "feedback-${EnvName}-AlbDns" }
+  JenkinsUrl:
+    Value: !Sub http://${JenkinsInstance.PublicDnsName}:8080
+  JenkinsInstanceId:
+    Value: !Ref JenkinsInstance
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  CodeDeployApplication:
+    Value: !Ref CodeDeployApp
+  DeploymentGroupName:
+    Value: !Ref DeploymentGroup

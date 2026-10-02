@@ -7,3 +7,4 @@ terraform/.terraform/
 terraform/*.tfstate*
 packaged-*.yaml
 *.pem
+k8s/.cluster.rendered.yaml
