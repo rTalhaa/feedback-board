@@ -16,10 +16,18 @@ Parameters:
     Type: Number
     Default: 7
     AllowedValues: [1, 3, 5, 7, 14, 30]
+  EnableCdn:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Create the CloudFront distribution (new accounts may need AWS to verify them first).
   ApiThrottleRate:
     Type: Number
     Default: 20
     Description: Steady-state requests per second allowed on the API.
+
+Conditions:
+  HasCdn: !Equals [!Ref EnableCdn, "true"]
 
 Resources:
   FeedbackTable:
@@ -144,6 +152,7 @@ Resources:
         ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
 
   SiteOAC:
+    Condition: HasCdn
     Type: AWS::CloudFront::OriginAccessControl
     Properties:
       OriginAccessControlConfig:
@@ -153,6 +162,7 @@ Resources:
         SigningProtocol: sigv4
 
   Distribution:
+    Condition: HasCdn
     Type: AWS::CloudFront::Distribution
     Properties:
       DistributionConfig:
@@ -183,6 +193,7 @@ Resources:
             OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
 
   SiteBucketPolicy:
+    Condition: HasCdn
     Type: AWS::S3::BucketPolicy
     Properties:
       Bucket: !Ref SiteBucket
@@ -200,6 +211,7 @@ Resources:
 
 Outputs:
   SiteUrl:
+    Condition: HasCdn
     Description: Public URL of the app (CloudFront)
     Value: !Sub https://${Distribution.DomainName}
   ApiUrl:
@@ -215,6 +227,7 @@ Outputs:
     Value: !Ref SiteBucket
     Export: { Name: !Sub "feedback-${EnvName}-SiteBucket" }
   DistributionId:
+    Condition: HasCdn
     Value: !Ref Distribution
   FunctionName:
     Value: !Ref Function

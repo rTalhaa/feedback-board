@@ -155,6 +155,9 @@ scripts/teardown.sh all    # everything, including Terraform
 
 ## Notes
 
+- **CloudFront** is controlled by the `EnableCdn` parameter of the serverless stack. New AWS accounts must be
+  verified by AWS Support before they can create distributions. Until then the stack deploys without it and
+  the API is reachable at `ApiUrl`. After verification, set the default to `"true"` and push, and the pipeline adds it.
 - **CodeCommit** is not used: it is closed to new AWS customers, and the brief specifies GitHub.
 - The network uses the default VPC's public subnets with security-group isolation and no NAT gateway,
   to keep cost low. A production setup would put tasks, instances and RDS in private subnets.

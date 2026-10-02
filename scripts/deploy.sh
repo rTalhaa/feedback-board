@@ -40,6 +40,10 @@ core() {
   aws s3 cp web/index.html "s3://$(out "feedback-serverless-$ENV" SiteBucketName)/index.html" --cache-control max-age=60
 
   echo "==> Bootstrap image"
+  # Throwaway docker config: Windows credential stores reject ECR's long tokens.
+  # A non-empty "auths" stops docker auto-selecting the OS store, so it uses this file instead.
+  DOCKER_CONFIG=$(mktemp -d); export DOCKER_CONFIG; trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+  echo '{"auths":{"placeholder.invalid":{}}}' > "$DOCKER_CONFIG/config.json"
   aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR%%/*}"
   docker build --build-arg APP_VERSION=bootstrap -t "$ECR:bootstrap" app
   docker push "$ECR:bootstrap" || true   # tags are immutable; already pushed on re-runs

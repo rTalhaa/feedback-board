@@ -252,17 +252,6 @@ Resources:
                 CacheControl: max-age=60
               InputArtifacts: [{ Name: WebOutput }]
 
-  PipelineNotifications:
-    Type: AWS::CodeStarNotifications::NotificationRule
-    Properties:
-      Name: !Sub feedback-pipeline-${EnvName}
-      DetailType: FULL
-      Resource: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
-      EventTypeIds:
-        - codepipeline-pipeline-pipeline-execution-failed
-        - codepipeline-pipeline-pipeline-execution-succeeded
-      Targets: [{ TargetType: SNS, TargetAddress: !Ref AlertsTopicArn }]
-
 Outputs:
   PipelineUrl:
     Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view?region=${AWS::Region}
