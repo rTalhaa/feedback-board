@@ -75,11 +75,9 @@ ec2() {
   cat <<EOF
 
 Done. Jenkins: $(out "feedback-ec2-$ENV" JenkinsUrl)  (allowed from $ip only)
-Initial admin password (wait ~3 min for install):
+Configure Jenkins as code once it has installed (~3 min):
   aws ssm send-command --instance-ids $jenkins --document-name AWS-RunShellScript \\
-    --parameters commands='cat /var/lib/jenkins/secrets/initialAdminPassword' --query Command.CommandId --output text
-Then: install suggested plugins > New Item > Pipeline > "Pipeline script from SCM" > Git
-  https://github.com/$(git remote get-url origin | sed -E 's#.*github.com[:/]##; s#\.git$##') branch main, script path Jenkinsfile
+    --parameters "{\"commands\":[\"echo $(base64 -w0 jenkins/configure.sh) | base64 -d | bash\"]}"
 EC2 app: $(out "feedback-ec2-$ENV" Ec2AppUrl)
 EOF
 }

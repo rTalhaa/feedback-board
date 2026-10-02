@@ -79,9 +79,11 @@ This applies Terraform and then deploys the four CloudFormation stacks in order.
 scripts/deploy.sh ec2
 ```
 
-The script prints the Jenkins URL and the command to read the initial admin password. In Jenkins,
-install the suggested plugins, then create a **Pipeline** job with *Pipeline script from SCM* pointing
-at this repository (`Jenkinsfile`). Jenkins polls every 5 minutes, or you can click *Build Now*.
+Jenkins is then configured as code with `jenkins/configure.sh`, run on the server through SSM Run
+Command (no SSH). It installs the plugins (checksum-verified plugin manager), creates the `admin` user,
+skips the setup wizard, creates the `feedback-board-ec2` pipeline job from this repository's
+`Jenkinsfile`, and queues the first build. The admin password is generated on the server
+(`/var/lib/jenkins/admin-password`). Jenkins polls GitHub every 5 minutes for new commits.
 
 ### Phase 3: Kubernetes
 
