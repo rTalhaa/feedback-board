@@ -1,0 +1,327 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Feedback Board dashboard on ECS Fargate behind an ALB, released with CodeDeploy blue/green
+  (canary traffic shift, health checks, alarm-based automatic rollback) and CPU target-tracking autoscaling.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets in different AZs.
+  ImageUri:
+    Type: String
+    Description: Bootstrap image; later releases come from the pipeline.
+  KmsKeyArn:
+    Type: String
+  AlertsTopicArn:
+    Type: String
+  DesiredCount:
+    Type: Number
+    Default: 1
+  MaxCount:
+    Type: Number
+    Default: 3
+  CpuTargetPercent:
+    Type: Number
+    Default: 50
+  DeploymentConfig:
+    Type: String
+    Default: CodeDeployDefault.ECSCanary10Percent5Minutes
+    AllowedValues:
+      - CodeDeployDefault.ECSCanary10Percent5Minutes
+      - CodeDeployDefault.ECSLinear10PercentEvery1Minutes
+      - CodeDeployDefault.ECSAllAtOnce
+
+Resources:
+  # ---------- Network: ALB in public subnets, tasks only reachable from the ALB ----------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP to the ALB (80 production, 8080 test listener)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, CidrIp: 0.0.0.0/0 }
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Dashboard tasks, ALB only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub feedback-${EnvName}
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  # Blue and green target groups; CodeDeploy flips listeners between them.
+  BlueTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub feedback-${EnvName}-blue
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 8080
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes: [{ Key: deregistration_delay.timeout_seconds, Value: "10" }]
+
+  GreenTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub feedback-${EnvName}-green
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 8080
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes: [{ Key: deregistration_delay.timeout_seconds, Value: "10" }]
+
+  ProdListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref BlueTargetGroup }]
+
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions: [{ Type: forward, TargetGroupArn: !Ref BlueTargetGroup }]
+
+  # ---------- ECS ----------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub feedback-${EnvName}
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /feedback-board/${EnvName}/dashboard
+      RetentionInDays: 7
+      KmsKeyId: !Ref KmsKeyArn
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy]
+      Policies:
+        - PolicyName: kms-image-pull
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement: [{ Effect: Allow, Action: kms:Decrypt, Resource: !Ref KmsKeyArn }]
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ecs-tasks.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: read-feedback
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Scan
+                Resource: { "Fn::ImportValue": !Sub "feedback-${EnvName}-TableArn" }
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !Ref KmsKeyArn
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub feedback-dashboard-${EnvName}
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform: { OperatingSystemFamily: LINUX, CpuArchitecture: X86_64 }
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: dashboard
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          Environment:
+            - { Name: TABLE_NAME, Value: { "Fn::ImportValue": !Sub "feedback-${EnvName}-TableName" } }
+            - { Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: dashboard
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [ProdListener, TestListener]
+    Properties:
+      ServiceName: !Sub feedback-dashboard-${EnvName}
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      TaskDefinition: !Ref TaskDefinition
+      DeploymentController: { Type: CODE_DEPLOY }
+      HealthCheckGracePeriodSeconds: 30
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED   # public subnets, no NAT gateway needed to pull images
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref TaskSecurityGroup]
+      LoadBalancers:
+        - { ContainerName: dashboard, ContainerPort: 8080, TargetGroupArn: !Ref BlueTargetGroup }
+
+  # ---------- Auto scaling ----------
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub service/${Cluster}/${Service.Name}
+      MinCapacity: !Ref DesiredCount
+      MaxCapacity: !Ref MaxCount
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub feedback-${EnvName}-cpu-target
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ECSServiceAverageCPUUtilization }
+        TargetValue: !Ref CpuTargetPercent
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 120
+
+  # ---------- Rollback triggers ----------
+  Target5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${EnvName}-dashboard-5xx
+      AlarmDescription: Dashboard returning 5xx - rolls back an in-flight CodeDeploy release
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions: [{ Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopicArn]
+
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${EnvName}-dashboard-unhealthy
+      AlarmDescription: Green target group has unhealthy tasks during a release
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt GreenTargetGroup.TargetGroupFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopicArn]
+
+  # ---------- CodeDeploy blue/green ----------
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: codedeploy.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS]
+
+  CodeDeployApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub feedback-dashboard-${EnvName}
+      ComputePlatform: ECS
+
+  DeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApp
+      DeploymentGroupName: !Sub feedback-dashboard-${EnvName}-bg
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: !Ref DeploymentConfig
+      DeploymentStyle: { DeploymentType: BLUE_GREEN, DeploymentOption: WITH_TRAFFIC_CONTROL }
+      BlueGreenDeploymentConfiguration:
+        DeploymentReadyOption: { ActionOnTimeout: CONTINUE_DEPLOYMENT }
+        TerminateBlueInstancesOnDeploymentSuccess: { Action: TERMINATE, TerminationWaitTimeInMinutes: 5 }
+      ECSServices: [{ ClusterName: !Ref Cluster, ServiceName: !GetAtt Service.Name }]
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - TargetGroups: [{ Name: !GetAtt BlueTargetGroup.TargetGroupName }, { Name: !GetAtt GreenTargetGroup.TargetGroupName }]
+            ProdTrafficRoute: { ListenerArns: [!Ref ProdListener] }
+            TestTrafficRoute: { ListenerArns: [!Ref TestListener] }
+      AlarmConfiguration:
+        Enabled: true
+        Alarms: [{ Name: !Ref Target5xxAlarm }, { Name: !Ref UnhealthyHostsAlarm }]
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_ALARM]
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub http://${LoadBalancer.DNSName}
+  TestListenerUrl:
+    Description: Green version is reachable here during a release
+    Value: !Sub http://${LoadBalancer.DNSName}:8080
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  TaskFamily:
+    Value: !Sub feedback-dashboard-${EnvName}
+  CodeDeployApplication:
+    Value: !Ref CodeDeployApp
+  DeploymentGroupName:
+    Value: !Ref DeploymentGroup
+  LogGroupName:
+    Value: !Ref LogGroup
+    Export: { Name: !Sub "feedback-${EnvName}-DashboardLogGroup" }
+  LoadBalancerArn:
+    Value: !Ref LoadBalancer
+    Export: { Name: !Sub "feedback-${EnvName}-AlbArn" }
+  LoadBalancerFullName:
+    Value: !GetAtt LoadBalancer.LoadBalancerFullName
+    Export: { Name: !Sub "feedback-${EnvName}-AlbFullName" }
+  AlbSecurityGroupId:
+    Value: !Ref AlbSecurityGroup
+    Export: { Name: !Sub "feedback-${EnvName}-AlbSg" }
+  AlbDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+    Export: { Name: !Sub "feedback-${EnvName}-AlbDns" }

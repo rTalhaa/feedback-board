@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feedback Board</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; }
+  textarea, select, button { font: inherit; width: 100%; margin: 6px 0; padding: 8px; box-sizing: border-box; }
+  li { padding: 8px 0; border-bottom: 1px solid #ddd; list-style: none; }
+  #status { min-height: 1.4em; }
+</style>
+<h1>Feedback Board</h1>
+<form id="f">
+  <label for="message">Your feedback</label>
+  <textarea id="message" maxlength="500" required></textarea>
+  <label for="rating">Rating</label>
+  <select id="rating">
+    <option value="5">5 - Excellent</option><option value="4">4</option><option value="3">3</option>
+    <option value="2">2</option><option value="1">1 - Poor</option>
+  </select>
+  <button>Submit</button>
+</form>
+<p id="status" role="status"></p>
+<ul id="list"></ul>
+<script>
+  const list = document.getElementById("list"), status = document.getElementById("status");
+  async function load() {
+    const items = await (await fetch("/api/feedback")).json();
+    list.replaceChildren(...items.map(i => {
+      const li = document.createElement("li");
+      li.textContent = "★".repeat(i.rating) + "  " + i.message;
+      return li;
+    }));
+  }
+  document.getElementById("f").onsubmit = async e => {
+    e.preventDefault();
+    const res = await fetch("/api/feedback", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ message: message.value, rating: Number(rating.value) }),
+    });
+    status.textContent = res.ok ? "Thanks!" : (await res.json()).error;
+    if (res.ok) { message.value = ""; load(); }
+  };
+  load();
+</script>
+</html>

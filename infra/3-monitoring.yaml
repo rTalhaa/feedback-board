@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Feedback Board centralized logging - metric filters that parse the JSON logs of every tier,
+  error-pattern alarms to SNS, a CloudWatch dashboard and saved Logs Insights queries.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  AlertsTopicArn:
+    Type: String
+  LatencyThresholdMs:
+    Type: Number
+    Default: 1000
+
+Resources:
+  # ---------- Log parsing -> custom metrics (namespace FeedbackBoard) ----------
+  ApiErrorFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub /aws/lambda/feedback-api-${EnvName}
+      FilterName: api-errors
+      FilterPattern: '{ $.level = "ERROR" }'
+      MetricTransformations:
+        - { MetricNamespace: FeedbackBoard, MetricName: ApiErrors, MetricValue: "1", DefaultValue: 0 }
+
+  ApiValidationFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub /aws/lambda/feedback-api-${EnvName}
+      FilterName: api-validation-failures
+      FilterPattern: '{ $.level = "WARN" && $.msg = "validation failed" }'
+      MetricTransformations:
+        - { MetricNamespace: FeedbackBoard, MetricName: ApiValidationFailures, MetricValue: "1", DefaultValue: 0 }
+
+  ApiLatencyFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub /aws/lambda/feedback-api-${EnvName}
+      FilterName: api-latency
+      FilterPattern: '{ $.msg = "request" && $.latency_ms = * }'
+      MetricTransformations:
+        - { MetricNamespace: FeedbackBoard, MetricName: ApiLatencyMs, MetricValue: $.latency_ms, Unit: Milliseconds }
+
+  ApiGateway5xxFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Sub /feedback-board/${EnvName}/api-access
+      FilterName: gateway-5xx
+      FilterPattern: '{ $.status >= 500 }'
+      MetricTransformations:
+        - { MetricNamespace: FeedbackBoard, MetricName: Gateway5xx, MetricValue: "1", DefaultValue: 0 }
+
+  Dashboard5xxFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: { "Fn::ImportValue": !Sub "feedback-${EnvName}-DashboardLogGroup" }
+      FilterName: dashboard-5xx
+      FilterPattern: '{ $.status >= 500 }'
+      MetricTransformations:
+        - { MetricNamespace: FeedbackBoard, MetricName: Dashboard5xx, MetricValue: "1", DefaultValue: 0 }
+
+  # Plain-text pattern: Python tracebacks that escape the JSON logger.
+  TracebackFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: { "Fn::ImportValue": !Sub "feedback-${EnvName}-DashboardLogGroup" }
+      FilterName: dashboard-tracebacks
+      FilterPattern: '?Traceback ?"unhandled"'
+      MetricTransformations:
+        - { MetricNamespace: FeedbackBoard, MetricName: DashboardExceptions, MetricValue: "1", DefaultValue: 0 }
+
+  # ---------- Alerting on error patterns ----------
+  ApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${EnvName}-api-errors
+      AlarmDescription: Lambda logged ERROR lines (failed requests)
+      Namespace: FeedbackBoard
+      MetricName: ApiErrors
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopicArn]
+      OKActions: [!Ref AlertsTopicArn]
+
+  ValidationSpikeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${EnvName}-validation-spike
+      AlarmDescription: Many rejected requests - broken client or abuse
+      Namespace: FeedbackBoard
+      MetricName: ApiValidationFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopicArn]
+
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${EnvName}-api-latency-p90
+      AlarmDescription: p90 API latency above threshold
+      Namespace: FeedbackBoard
+      MetricName: ApiLatencyMs
+      ExtendedStatistic: p90
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref LatencyThresholdMs
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopicArn]
+
+  DashboardExceptionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${EnvName}-dashboard-exceptions
+      AlarmDescription: Unhandled exceptions in the ECS dashboard
+      Namespace: FeedbackBoard
+      MetricName: DashboardExceptions
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopicArn]
+
+  LambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub feedback-${EnvName}-lambda-throttles
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions: [{ Name: FunctionName, Value: !Sub "feedback-api-${EnvName}" }]
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopicArn]
+
+  # ---------- Saved Logs Insights queries (span every tier) ----------
+  ErrorsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub feedback-${EnvName}/errors-all-tiers
+      LogGroupNames:
+        - !Sub /aws/lambda/feedback-api-${EnvName}
+        - !Sub /feedback-board/${EnvName}/api-access
+        - { "Fn::ImportValue": !Sub "feedback-${EnvName}-DashboardLogGroup" }
+      QueryString: |
+        fields @timestamp, @log, level, msg, status, error, path
+        | filter level = "ERROR" or status >= 500 or @message like /Traceback/
+        | sort @timestamp desc
+        | limit 50
+
+  SlowRequestsQuery:
+    Type: AWS::Logs::QueryDefinition
+    Properties:
+      Name: !Sub feedback-${EnvName}/slowest-requests
+      LogGroupNames:
+        - !Sub /aws/lambda/feedback-api-${EnvName}
+        - { "Fn::ImportValue": !Sub "feedback-${EnvName}-DashboardLogGroup" }
+      QueryString: |
+        filter msg = "request"
+        | stats count() as requests, avg(latency_ms) as avg_ms, pct(latency_ms, 95) as p95_ms by bin(5m)
+        | sort @timestamp desc
+
+  # ---------- Dashboard ----------
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub feedback-board-${EnvName}
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {"type":"text","x":0,"y":0,"width":24,"height":1,
+               "properties":{"markdown":"## Feedback Board (${EnvName}) - API (Lambda) · Dashboard (ECS) · Errors from parsed logs"}},
+              {"type":"metric","x":0,"y":1,"width":8,"height":6,"properties":{"title":"API: invocations / errors","region":"${AWS::Region}","stat":"Sum","period":60,
+                "metrics":[["AWS/Lambda","Invocations","FunctionName","feedback-api-${EnvName}"],[".","Errors",".","."],["FeedbackBoard","ApiErrors"],[".","ApiValidationFailures"]]}},
+              {"type":"metric","x":8,"y":1,"width":8,"height":6,"properties":{"title":"API latency (from logs, ms)","region":"${AWS::Region}","period":60,
+                "metrics":[["FeedbackBoard","ApiLatencyMs",{"stat":"p50"}],["...",{"stat":"p90"}],["...",{"stat":"Maximum"}]]}},
+              {"type":"alarm","x":16,"y":1,"width":8,"height":6,"properties":{"title":"Alarms","alarms":[
+                "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:feedback-${EnvName}-api-errors",
+                "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:feedback-${EnvName}-api-latency-p90",
+                "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:feedback-${EnvName}-validation-spike",
+                "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:feedback-${EnvName}-dashboard-exceptions",
+                "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:feedback-${EnvName}-dashboard-5xx",
+                "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:feedback-${EnvName}-dashboard-unhealthy",
+                "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:feedback-${EnvName}-lambda-throttles"]}},
+              {"type":"metric","x":0,"y":7,"width":8,"height":6,"properties":{"title":"ALB: requests / 5xx","region":"${AWS::Region}","stat":"Sum","period":60,
+                "metrics":[["AWS/ApplicationELB","RequestCount","LoadBalancer","${AlbFullName}"],[".","HTTPCode_Target_5XX_Count",".","."],["FeedbackBoard","Dashboard5xx"],[".","Gateway5xx"]]}},
+              {"type":"metric","x":8,"y":7,"width":8,"height":6,"properties":{"title":"ECS service CPU / memory %","region":"${AWS::Region}","stat":"Average","period":60,
+                "metrics":[["AWS/ECS","CPUUtilization","ClusterName","feedback-${EnvName}","ServiceName","feedback-dashboard-${EnvName}"],[".","MemoryUtilization",".",".",".","."]]}},
+              {"type":"metric","x":16,"y":7,"width":8,"height":6,"properties":{"title":"DynamoDB capacity used","region":"${AWS::Region}","stat":"Sum","period":60,
+                "metrics":[["AWS/DynamoDB","ConsumedReadCapacityUnits","TableName","feedback-${EnvName}"],[".","ConsumedWriteCapacityUnits",".","."]]}},
+              {"type":"log","x":0,"y":13,"width":24,"height":6,"properties":{"title":"Recent errors (all tiers)","region":"${AWS::Region}","view":"table",
+                "query":"SOURCE '/aws/lambda/feedback-api-${EnvName}' | SOURCE '/feedback-board/${EnvName}/api-access' | SOURCE '${DashLogs}' | fields @timestamp, @log, level, msg, status, error | filter level = \"ERROR\" or status >= 500 | sort @timestamp desc | limit 20"}}
+            ]
+          }
+        - AlbFullName: { "Fn::ImportValue": !Sub "feedback-${EnvName}-AlbFullName" }
+          DashLogs: { "Fn::ImportValue": !Sub "feedback-${EnvName}-DashboardLogGroup" }
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=feedback-board-${EnvName}

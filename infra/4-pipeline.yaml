@@ -1,0 +1,271 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Feedback Board CI/CD - CodePipeline: GitHub source -> CodeBuild (tests, vulnerability scan, image build)
+  -> manual approval -> deploy (CloudFormation serverless stack, S3 site, CodeDeploy ECS blue/green).
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  GitHubRepo:
+    Type: String
+    Description: owner/name
+  Branch:
+    Type: String
+    Default: main
+  KmsKeyArn:
+    Type: String
+  AlertsTopicArn:
+    Type: String
+  EcrRepositoryUri:
+    Type: String
+  ArtifactBucketName:
+    Type: String
+    Description: From terraform output artifact_bucket
+
+Resources:
+  # Created PENDING - approve once in Console > Developer Tools > Settings > Connections.
+  GitHubConnection:
+    Type: AWS::CodeConnections::Connection
+    Properties:
+      ConnectionName: !Sub feedback-github-${EnvName}
+      ProviderType: GitHub
+
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /feedback-board/${EnvName}/codebuild
+      RetentionInDays: 7
+      KmsKeyId: !Ref KmsKeyArn
+
+  # ---------- CodeBuild ----------
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: codebuild.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub ${BuildLogGroup.Arn}:*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart,
+                         ecr:CompleteLayerUpload, ecr:PutImage, ecr:BatchGetImage]
+                Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/feedback-board/*
+              - Effect: Allow
+                Action: ecs:DescribeTaskDefinition
+                Resource: "*"
+              - Effect: Allow
+                Action: [codebuild:CreateReportGroup, codebuild:CreateReport, codebuild:UpdateReport, codebuild:BatchPutTestCases]
+                Resource: !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/feedback-build-${EnvName}-*
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey]
+                Resource: !Ref KmsKeyArn
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub feedback-build-${EnvName}
+      ServiceRole: !GetAtt BuildRole.Arn
+      EncryptionKey: !Ref KmsKeyArn
+      Source: { Type: CODEPIPELINE, BuildSpec: buildspec.yml }
+      Artifacts: { Type: CODEPIPELINE }
+      TimeoutInMinutes: 20
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true   # docker build
+        EnvironmentVariables:
+          - { Name: ECR_URI, Value: !Ref EcrRepositoryUri }
+          - { Name: TASK_FAMILY, Value: !Sub "feedback-dashboard-${EnvName}" }
+          - { Name: ARTIFACT_BUCKET, Value: !Ref ArtifactBucketName }
+          - { Name: KMS_KEY_ARN, Value: !Ref KmsKeyArn }
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref BuildLogGroup }
+
+  # ---------- Role CloudFormation assumes to deploy the serverless stack ----------
+  # NOTE: service-level wildcards on the services this stack uses; narrow to resource ARNs for production.
+  CfnDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: cloudformation.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: deploy-serverless
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [lambda:*, apigateway:*, dynamodb:*, cloudfront:*, logs:*]
+                Resource: "*"
+              - Effect: Allow
+                Action: [s3:*]
+                Resource:
+                  - !Sub arn:${AWS::Partition}:s3:::feedback-site-${EnvName}-${AWS::AccountId}
+                  - !Sub arn:${AWS::Partition}:s3:::feedback-site-${EnvName}-${AWS::AccountId}/*
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*
+              - Effect: Allow
+                Action: [iam:GetRole, iam:CreateRole, iam:DeleteRole, iam:PutRolePolicy, iam:DeleteRolePolicy,
+                         iam:GetRolePolicy, iam:PassRole, iam:TagRole, iam:UntagRole]
+                Resource: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/feedback-serverless-*
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey, kms:DescribeKey, kms:CreateGrant]
+                Resource: !Ref KmsKeyArn
+
+  # ---------- CodePipeline ----------
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: codepipeline.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: pipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [codeconnections:UseConnection, codestar-connections:UseConnection]
+                Resource: !Ref GitHubConnection
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetBucketVersioning, s3:GetObjectVersion]
+                Resource: [!Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}", !Sub "arn:${AWS::Partition}:s3:::${ArtifactBucketName}/*"]
+              - Effect: Allow
+                Action: [s3:PutObject, s3:PutObjectAcl]
+                Resource: !Sub
+                  - arn:${AWS::Partition}:s3:::${Bucket}/*
+                  - Bucket: { "Fn::ImportValue": !Sub "feedback-${EnvName}-SiteBucket" }
+              - Effect: Allow
+                Action: [codebuild:StartBuild, codebuild:BatchGetBuilds]
+                Resource: !GetAtt BuildProject.Arn
+              - Effect: Allow
+                Action: [cloudformation:DescribeStacks, cloudformation:CreateStack, cloudformation:UpdateStack,
+                         cloudformation:CreateChangeSet, cloudformation:DescribeChangeSet, cloudformation:ExecuteChangeSet]
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/feedback-serverless-${EnvName}/*
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt CfnDeployRole.Arn
+              - Effect: Allow
+                Action: [codedeploy:CreateDeployment, codedeploy:GetDeployment, codedeploy:GetApplication,
+                         codedeploy:GetApplicationRevision, codedeploy:RegisterApplicationRevision,
+                         codedeploy:GetDeploymentConfig]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ecs:RegisterTaskDefinition, ecs:DescribeTaskDefinition, ecs:DescribeServices, ecs:TagResource]
+                Resource: "*"
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: "*"
+                Condition: { StringEquals: { "iam:PassedToService": ecs-tasks.amazonaws.com } }
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertsTopicArn
+              - Effect: Allow
+                Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey]
+                Resource: !Ref KmsKeyArn
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub feedback-board-${EnvName}
+      PipelineType: V2
+      ExecutionMode: QUEUED
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucketName
+        EncryptionKey: { Id: !Ref KmsKeyArn, Type: KMS }
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHub
+              ActionTypeId: { Category: Source, Owner: AWS, Provider: CodeStarSourceConnection, Version: "1" }
+              Configuration:
+                ConnectionArn: !Ref GitHubConnection
+                FullRepositoryId: !Ref GitHubRepo
+                BranchName: !Ref Branch
+                OutputArtifactFormat: CODE_ZIP
+                DetectChanges: true
+              OutputArtifacts: [{ Name: SourceOutput }]
+        - Name: Build
+          Actions:
+            - Name: TestScanBuild
+              ActionTypeId: { Category: Build, Owner: AWS, Provider: CodeBuild, Version: "1" }
+              Configuration: { ProjectName: !Ref BuildProject }
+              InputArtifacts: [{ Name: SourceOutput }]
+              OutputArtifacts: [{ Name: BuildOutput }, { Name: WebOutput }]
+        - Name: Approval
+          Actions:
+            - Name: ReleaseApproval
+              ActionTypeId: { Category: Approval, Owner: AWS, Provider: Manual, Version: "1" }
+              Configuration:
+                NotificationArn: !Ref AlertsTopicArn
+                CustomData: Tests and vulnerability scan passed. Approve to release to production.
+        - Name: Deploy
+          Actions:
+            - Name: ServerlessStack
+              RunOrder: 1
+              ActionTypeId: { Category: Deploy, Owner: AWS, Provider: CloudFormation, Version: "1" }
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: !Sub feedback-serverless-${EnvName}
+                TemplatePath: BuildOutput::packaged-serverless.yaml
+                Capabilities: CAPABILITY_IAM
+                RoleArn: !GetAtt CfnDeployRole.Arn
+                ParameterOverrides: !Sub '{"EnvName":"${EnvName}","KmsKeyArn":"${KmsKeyArn}"}'
+              InputArtifacts: [{ Name: BuildOutput }]
+            - Name: Dashboard-BlueGreen
+              RunOrder: 1
+              ActionTypeId: { Category: Deploy, Owner: AWS, Provider: CodeDeployToECS, Version: "1" }
+              Configuration:
+                ApplicationName: !Sub feedback-dashboard-${EnvName}
+                DeploymentGroupName: !Sub feedback-dashboard-${EnvName}-bg
+                TaskDefinitionTemplateArtifact: BuildOutput
+                TaskDefinitionTemplatePath: taskdef.json
+                AppSpecTemplateArtifact: BuildOutput
+                AppSpecTemplatePath: appspec.yaml
+                Image1ArtifactName: BuildOutput
+                Image1ContainerName: IMAGE1_NAME
+              InputArtifacts: [{ Name: BuildOutput }]
+            - Name: PublishSite
+              RunOrder: 2
+              ActionTypeId: { Category: Deploy, Owner: AWS, Provider: S3, Version: "1" }
+              Configuration:
+                BucketName: { "Fn::ImportValue": !Sub "feedback-${EnvName}-SiteBucket" }
+                Extract: true
+                CacheControl: max-age=60
+              InputArtifacts: [{ Name: WebOutput }]
+
+  PipelineNotifications:
+    Type: AWS::CodeStarNotifications::NotificationRule
+    Properties:
+      Name: !Sub feedback-pipeline-${EnvName}
+      DetailType: FULL
+      Resource: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+      EventTypeIds:
+        - codepipeline-pipeline-pipeline-execution-failed
+        - codepipeline-pipeline-pipeline-execution-succeeded
+      Targets: [{ TargetType: SNS, TargetAddress: !Ref AlertsTopicArn }]
+
+Outputs:
+  PipelineUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view?region=${AWS::Region}
+  ConnectionArn:
+    Description: Approve this pending connection once in the console
+    Value: !Ref GitHubConnection

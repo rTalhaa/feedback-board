@@ -1,0 +1,48 @@
+version: 0.2
+
+# Env from the CodeBuild project: ECR_URI, TASK_FAMILY, ARTIFACT_BUCKET, KMS_KEY_ARN
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install -q -r app/requirements.txt pytest pip-audit
+  pre_build:
+    commands:
+      - echo "Quality gate - unit tests, self-checks, dependency vulnerabilities"
+      - python lambda/handler.py
+      - (cd app && python -m pytest -q --junitxml=../reports/junit.xml)
+      - pip-audit -r app/requirements.txt
+      - TAG=$(echo "$CODEBUILD_RESOLVED_SOURCE_VERSION" | cut -c1-7)
+      - aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_URI%%/*}"
+  build:
+    commands:
+      - docker build --build-arg APP_VERSION="$TAG" -t "$ECR_URI:$TAG" app
+      - docker push "$ECR_URI:$TAG"
+      - aws cloudformation package --template-file infra/1-serverless.yaml --s3-bucket "$ARTIFACT_BUCKET"
+        --s3-prefix lambda --kms-key-id "$KMS_KEY_ARN" --output-template-file packaged-serverless.yaml
+  post_build:
+    commands:
+      - printf '{"ImageURI":"%s"}' "$ECR_URI:$TAG" > imageDetail.json
+      # Next task definition = current one with the image placeholder and the release version.
+      - >-
+        aws ecs describe-task-definition --task-definition "$TASK_FAMILY" --query taskDefinition |
+        jq --arg v "$TAG" '{family, taskRoleArn, executionRoleArn, networkMode, containerDefinitions,
+        requiresCompatibilities, cpu, memory, runtimePlatform}
+        | .containerDefinitions[0].image = "<IMAGE1_NAME>"
+        | .containerDefinitions[0].environment |= (map(select(.name != "APP_VERSION")) + [{name: "APP_VERSION", value: $v}])'
+        > taskdef.json
+
+reports:
+  unit-tests:
+    base-directory: reports
+    files: [junit.xml]
+    file-format: JUNITXML
+
+artifacts:
+  secondary-artifacts:
+    BuildOutput:
+      files: [appspec.yaml, taskdef.json, imageDetail.json, packaged-serverless.yaml]
+    WebOutput:
+      base-directory: web
+      files: ["**/*"]
