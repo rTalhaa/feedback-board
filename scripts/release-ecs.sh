@@ -16,7 +16,7 @@ FAMILY=feedback-dashboard-$ENV
 DOCKER_CONFIG=$(mktemp -d); export DOCKER_CONFIG; trap 'rm -rf "$DOCKER_CONFIG"' EXIT
 echo '{"auths":{"placeholder.invalid":{}}}' > "$DOCKER_CONFIG/config.json"
 aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR%%/*}" >/dev/null
-docker build -q --build-arg APP_VERSION="$VERSION" -t "$ECR:$VERSION" "$APP_DIR"
+docker build -q --provenance=false --build-arg APP_VERSION="$VERSION" -t "$ECR:$VERSION" "$APP_DIR"
 docker push -q "$ECR:$VERSION"
 
 # Next revision = current one with the new image and version.

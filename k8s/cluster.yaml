@@ -7,6 +7,9 @@ metadata:
   region: ap-south-1
   tags: { Project: feedback-board }
 
+autoModeConfig:
+  enabled: false   # explicit managed node group below
+
 addons:
   - name: vpc-cni
   - name: coredns

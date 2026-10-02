@@ -45,7 +45,7 @@ core() {
   DOCKER_CONFIG=$(mktemp -d); export DOCKER_CONFIG; trap 'rm -rf "$DOCKER_CONFIG"' EXIT
   echo '{"auths":{"placeholder.invalid":{}}}' > "$DOCKER_CONFIG/config.json"
   aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR%%/*}"
-  docker build --build-arg APP_VERSION=bootstrap -t "$ECR:bootstrap" app
+  docker build --provenance=false --build-arg APP_VERSION=bootstrap -t "$ECR:bootstrap" app
   docker push "$ECR:bootstrap" || true   # tags are immutable; already pushed on re-runs
 
   cfn "feedback-ecs-$ENV" infra/2-ecs.yaml VpcId="$VPC" SubnetIds="$SUBNETS" ImageUri="$ECR:bootstrap" \
@@ -87,8 +87,8 @@ eks() {
   local account; account=$(aws sts get-caller-identity --query Account --output text)
   sed -e "s|\${ACCOUNT_ID}|$account|g" -e "s|\${KMS_KEY_ARN}|$KMS|g" k8s/cluster.yaml > k8s/.cluster.rendered.yaml
   eksctl create cluster -f k8s/.cluster.rendered.yaml
-  local tag; tag=$(aws ecr describe-images --repository-name feedback-board/dashboard \
-    --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags[0]' --output text)
+  local tag; tag=${IMAGE_TAG:-$(aws ecr describe-images --repository-name feedback-board/dashboard \
+    --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags[0]' --output text)}
   sed "s|\${IMAGE}|$ECR:$tag|" k8s/app.yaml | kubectl apply -f -
   kubectl rollout status deployment/feedback-dashboard --timeout=5m
   echo "EKS app: http://$(kubectl get svc feedback-dashboard -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
